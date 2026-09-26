@@ -100,6 +100,8 @@ void airoha_xpon_clear_assignment(struct airoha_xpon *xpon)
 	xpon->eqd = 0;
 	xpon->service_ready = false;
 	xpon->data_path.count = 0;
+	WRITE_ONCE(xpon->data_path.pending_count, 0);
+	atomic_set(&xpon->data_path_retry_pending, 0);
 	xpon->data_path.configured = false;
 }
 
@@ -175,13 +177,17 @@ static int airoha_xpon_get_tcont(struct airoha_xpon *xpon, u8 index,
 	return 0;
 }
 
-static int airoha_xpon_find_or_create_tcont(struct airoha_xpon *xpon,
-                                            u16 alloc_id, u8 *index)
+/*
+ * T-CONT 0 shadows ONU-ID; ordinary Alloc-IDs start at index 1. first_free,
+ * when given, receives the first unused index or 0xff.
+ */
+static int airoha_xpon_find_tcont(struct airoha_xpon *xpon, u16 alloc_id,
+                                  u8 *index, u8 *first_free)
 {
-	u8 first_free = 0xff;
 	unsigned int i;
 
-	/* T-CONT 0 shadows ONU-ID; ordinary Alloc-IDs start at index 1. */
+	if (first_free)
+		*first_free = 0xff;
 	for (i = 1; i < 32; i++) {
 		u16 current_id;
 		bool valid;
@@ -194,10 +200,22 @@ static int airoha_xpon_find_or_create_tcont(struct airoha_xpon *xpon,
 			*index = i;
 			return 0;
 		}
-		if (!valid && first_free == 0xff)
-			first_free = i;
+		if (!valid && first_free && *first_free == 0xff)
+			*first_free = i;
 	}
 
+	return -ENOENT;
+}
+
+static int airoha_xpon_find_or_create_tcont(struct airoha_xpon *xpon,
+                                            u16 alloc_id, u8 *index)
+{
+	u8 first_free;
+	int ret;
+
+	ret = airoha_xpon_find_tcont(xpon, alloc_id, index, &first_free);
+	if (ret != -ENOENT)
+		return ret;
 	if (first_free == 0xff)
 		return -ENOSPC;
 	if (airoha_xpon_set_tcont(xpon, first_free, alloc_id, true))
@@ -207,23 +225,36 @@ static int airoha_xpon_find_or_create_tcont(struct airoha_xpon *xpon,
 	return 0;
 }
 
-static int airoha_xpon_remove_tcont(struct airoha_xpon *xpon, u16 alloc_id)
+void airoha_xpon_clear_tconts(struct airoha_xpon *xpon)
 {
 	unsigned int i;
+	int ret;
 
+	/*
+	 * Deactivate releases every non-default Alloc-ID; MAC reset is not known
+	 * to clear this table.
+	 */
+	mutex_lock(&xpon->ploam_lock);
 	for (i = 1; i < 32; i++) {
-		u16 current_id;
-		bool valid;
-		int ret;
-
-		ret = airoha_xpon_get_tcont(xpon, i, &current_id, &valid);
-		if (ret)
-			return ret;
-		if (valid && current_id == alloc_id)
-			return airoha_xpon_set_tcont(xpon, i, 0x3ff, false);
+		ret = airoha_xpon_set_tcont(xpon, i, 0x3ff, false);
+		if (ret) {
+			dev_warn(xpon->dev, "T-CONT %u clear failed: %d\n", i,
+			         ret);
+			break;
+		}
 	}
+	mutex_unlock(&xpon->ploam_lock);
+}
 
-	return -ENOENT;
+static int airoha_xpon_remove_tcont(struct airoha_xpon *xpon, u16 alloc_id)
+{
+	u8 index;
+	int ret;
+
+	ret = airoha_xpon_find_tcont(xpon, alloc_id, &index, NULL);
+	if (ret)
+		return ret;
+	return airoha_xpon_set_tcont(xpon, index, 0x3ff, false);
 }
 
 static int airoha_xpon_set_gem(struct airoha_xpon *xpon, u16 gem_id, bool valid,
@@ -257,7 +288,7 @@ airoha_xpon_data_path_has_gem(const struct airoha_xpon_data_path_entry *entries,
 	return false;
 }
 
-int airoha_xpon_replace_data_paths(
+static int airoha_xpon_apply_data_paths_locked(
 	struct airoha_xpon *xpon,
 	const struct airoha_xpon_data_path_entry *requested, unsigned int count)
 {
@@ -267,54 +298,53 @@ int airoha_xpon_replace_data_paths(
 	unsigned int i, j;
 	int ret = 0;
 
-	if (!count || count > AIROHA_XPON_MAX_DATA_PATHS)
-		return -EINVAL;
-	for (i = 0; i < count; i++) {
-		if ((!requested[i].multicast &&
-		     requested[i].alloc_id > 0x3fff) ||
-		    (requested[i].multicast &&
-		     requested[i].alloc_id != 0xffff) ||
-		    (requested[i].vlan_id > 4094 &&
-		     requested[i].vlan_id != AIROHA_PON_VID_ANY) ||
-		    !requested[i].pbit_mask)
-			return -EINVAL;
-		/*
-		 * VID_ANY covers untagged frames and tagged frames after VID lookup.
-		 * Equal VID/P-bit selectors conflict.
-		 */
-		for (j = 0; !requested[i].multicast && j < i; j++)
-			if (!requested[j].multicast &&
-			    requested[i].vlan_id == requested[j].vlan_id &&
-			    requested[i].pbit_mask & requested[j].pbit_mask)
-				return -EINVAL;
-	}
-
-	/* Keep Linux TX queues stopped until the complete flow table is active. */
-	mutex_lock(&xpon->state_lock);
-	if (!xpon->mac_initialized || xpon->onu_state != AIROHA_XGPON_O5) {
-		ret = -ENOLINK;
-		goto out_state;
-	}
-	airoha_xpon_set_data_path_link(xpon, false);
+	lockdep_assert_held(&xpon->state_lock);
+	if (!xpon->mac_initialized || xpon->onu_state != AIROHA_XGPON_O5)
+		return -ENOLINK;
 
 	mutex_lock(&xpon->ploam_lock);
+	/*
+	 * Only PLOAM assigns non-default Alloc-IDs. The OMCI MIB survives
+	 * Deactivate, so its T-CONTs wait for this epoch's Assign_Alloc-ID
+	 * instead of answering grants the OLT has not issued to this ONU.
+	 */
 	for (i = 0; i < count; i++) {
 		next[i] = requested[i];
 		if (next[i].multicast) {
 			next[i].tcont = 0xff;
-			ret = airoha_xpon_set_gem(xpon, next[i].gem_id, true,
-			                          false);
-			if (ret)
-				goto out_ploam;
 			continue;
 		}
-		ret = airoha_xpon_find_or_create_tcont(xpon, next[i].alloc_id,
-		                                       &next[i].tcont);
+		if (next[i].alloc_id == xpon->onu_id)
+			ret = airoha_xpon_find_or_create_tcont(
+				xpon, next[i].alloc_id, &next[i].tcont);
+		else
+			ret = airoha_xpon_find_tcont(xpon, next[i].alloc_id,
+			                             &next[i].tcont, NULL);
+		if (ret == -ENOENT) {
+			if (!xpon->data_path.pending_count)
+				dev_info(xpon->dev,
+				         "data paths deferred: count=%u, Alloc-ID %u not assigned by PLOAM\n",
+				         count, next[i].alloc_id);
+			memcpy(xpon->data_path.pending, requested,
+			       sizeof(requested[0]) * count);
+			WRITE_ONCE(xpon->data_path.pending_count, count);
+			ret = -EAGAIN;
+			goto out_ploam;
+		}
 		if (ret)
 			goto out_ploam;
-		ret = airoha_xpon_set_gem(xpon, next[i].gem_id, true, true);
+	}
+	WRITE_ONCE(xpon->data_path.pending_count, 0);
+
+	/* Keep Linux TX queues stopped until the complete flow table is active. */
+	airoha_xpon_set_data_path_link(xpon, false);
+	for (i = 0; i < count; i++) {
+		ret = airoha_xpon_set_gem(xpon, next[i].gem_id, true,
+		                          !next[i].multicast);
 		if (ret)
 			goto out_ploam;
+		if (next[i].multicast)
+			continue;
 		flows[flow_count].tcont = next[i].tcont;
 		flows[flow_count].gem_id = next[i].gem_id;
 		flows[flow_count].vlan_id = next[i].vlan_id;
@@ -357,9 +387,69 @@ int airoha_xpon_replace_data_paths(
 
 out_ploam:
 	mutex_unlock(&xpon->ploam_lock);
-out_state:
+	return ret;
+}
+
+int airoha_xpon_replace_data_paths(
+	struct airoha_xpon *xpon,
+	const struct airoha_xpon_data_path_entry *requested, unsigned int count)
+{
+	unsigned int i, j;
+	int ret;
+
+	if (!count || count > AIROHA_XPON_MAX_DATA_PATHS)
+		return -EINVAL;
+	for (i = 0; i < count; i++) {
+		if ((!requested[i].multicast &&
+		     requested[i].alloc_id > 0x3fff) ||
+		    (requested[i].multicast &&
+		     requested[i].alloc_id != 0xffff) ||
+		    (requested[i].vlan_id > 4094 &&
+		     requested[i].vlan_id != AIROHA_PON_VID_ANY) ||
+		    !requested[i].pbit_mask)
+			return -EINVAL;
+		/*
+		 * VID_ANY covers untagged frames and tagged frames after VID lookup.
+		 * Equal VID/P-bit selectors conflict.
+		 */
+		for (j = 0; !requested[i].multicast && j < i; j++)
+			if (!requested[j].multicast &&
+			    requested[i].vlan_id == requested[j].vlan_id &&
+			    requested[i].pbit_mask & requested[j].pbit_mask)
+				return -EINVAL;
+	}
+
+	mutex_lock(&xpon->state_lock);
+	ret = airoha_xpon_apply_data_paths_locked(xpon, requested, count);
 	mutex_unlock(&xpon->state_lock);
 	return ret;
+}
+
+void airoha_xpon_retry_data_paths(struct airoha_xpon *xpon)
+{
+	struct airoha_xpon_data_path_entry pending[AIROHA_XPON_MAX_DATA_PATHS];
+	unsigned int count = xpon->data_path.pending_count;
+	int ret;
+
+	lockdep_assert_held(&xpon->state_lock);
+	if (!count)
+		return;
+
+	memcpy(pending, xpon->data_path.pending, sizeof(pending[0]) * count);
+	ret = airoha_xpon_apply_data_paths_locked(xpon, pending, count);
+	if (ret) {
+		if (ret != -EAGAIN)
+			dev_warn(xpon->dev, "deferred data paths failed: %d\n",
+			         ret);
+		return;
+	}
+
+	/*
+	 * Only unicast lookups defer, so the applied set carries a service GEM.
+	 * pond cleared service_ready on -EAGAIN and learns of this apply late.
+	 */
+	xpon->service_ready = true;
+	airoha_xpon_leds_update(xpon);
 }
 
 int airoha_xpon_configure_data_path(struct airoha_xpon *xpon, u16 alloc_id,
@@ -383,6 +473,7 @@ int airoha_xpon_clear_data_path(struct airoha_xpon *xpon)
 	 * PLOAM Assign_Alloc-ID retains ownership of Alloc-IDs.
 	 */
 	mutex_lock(&xpon->state_lock);
+	WRITE_ONCE(xpon->data_path.pending_count, 0);
 	if (!xpon->data_path.configured)
 		goto out_state;
 
@@ -898,6 +989,9 @@ static int airoha_xpon_accept_alloc_id(struct airoha_xpon *xpon,
 	else
 		airoha_xpon_send_ack(xpon, message[3],
 		                     AIROHA_XGPON_PLOAM_ACK_OK);
+	/* drain holds only ploam_lock; link_work applies under state_lock. */
+	if (!ret && type == 1 && READ_ONCE(xpon->data_path.pending_count))
+		atomic_set(&xpon->data_path_retry_pending, 1);
 	return ret;
 }
 

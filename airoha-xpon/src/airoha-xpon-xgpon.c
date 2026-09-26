@@ -316,7 +316,8 @@ irqreturn_t airoha_xpon_xgpon_irq(struct airoha_xpon *xpon)
 		dev_warn_ratelimited(
 			xpon->dev,
 			"PLOAMd FIFO drain reached the per-IRQ safety limit\n");
-	if (atomic_read(&xpon->mac_restart_pending))
+	if (atomic_read(&xpon->mac_restart_pending) ||
+	    atomic_read(&xpon->data_path_retry_pending))
 		mod_delayed_work(system_wq, &xpon->link_work, 0);
 
 	return IRQ_HANDLED;
@@ -441,6 +442,7 @@ static int airoha_xpon_xgpon_start_control(struct airoha_xpon *xpon)
 	xpon->crypto.key_exchange_completed_count = 0;
 	xpon->crypto.key_exchange_error_count = 0;
 	airoha_xpon_clear_assignment(xpon);
+	airoha_xpon_clear_tconts(xpon);
 	airoha_xpon_set_onu_state(xpon, AIROHA_XGPON_O2_3);
 
 	/* Clear bootloader state before enabling activation interrupts. */
