@@ -211,7 +211,10 @@ struct airoha_xpon_data_path_entry {
 
 struct airoha_xpon_data_path_state {
 	struct airoha_xpon_data_path_entry entries[AIROHA_XPON_MAX_DATA_PATHS];
+	/* OMCI paths wait here until PLOAM assigns every unicast Alloc-ID. */
+	struct airoha_xpon_data_path_entry pending[AIROHA_XPON_MAX_DATA_PATHS];
 	u8 count;
+	u8 pending_count;
 	/* The first mapping serves status reporting and EPON's single LLID. */
 	u16 alloc_id;
 	u16 gem_id;
@@ -255,6 +258,8 @@ struct airoha_xpon {
 	atomic_t mac_restart_pending;
 	/* link_work handles TX-late resync under state_lock. */
 	atomic_t tx_resync_pending;
+	/* Assign_Alloc-ID queues deferred data paths for link_work. */
+	atomic_t data_path_retry_pending;
 	enum airoha_xgpon_onu_state onu_state;
 	u16 onu_id;
 	u32 eqd;
@@ -373,6 +378,8 @@ int airoha_xpon_replace_data_paths(
 	const struct airoha_xpon_data_path_entry *requested,
 	unsigned int count);
 int airoha_xpon_clear_data_path(struct airoha_xpon *xpon);
+void airoha_xpon_retry_data_paths(struct airoha_xpon *xpon);
+void airoha_xpon_clear_tconts(struct airoha_xpon *xpon);
 unsigned int airoha_xpon_drain_ploamd(struct airoha_xpon *xpon);
 
 int airoha_xpon_crypto_init(struct airoha_xpon *xpon);

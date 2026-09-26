@@ -204,9 +204,10 @@ static ssize_t data_path_show(struct device *dev, struct device_attribute *attr,
 	ssize_t len;
 	unsigned int i;
 
-	len = sysfs_emit(buf, "configured=%d count=%u",
+	len = sysfs_emit(buf, "configured=%d count=%u pending=%u",
 	                 READ_ONCE(xpon->data_path.configured),
-	                 READ_ONCE(xpon->data_path.count));
+	                 READ_ONCE(xpon->data_path.count),
+	                 READ_ONCE(xpon->data_path.pending_count));
 	for (i = 0; i < READ_ONCE(xpon->data_path.count); i++) {
 		const struct airoha_xpon_data_path_entry *path =
 			&xpon->data_path.entries[i];

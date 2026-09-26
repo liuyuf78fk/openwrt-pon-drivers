@@ -213,6 +213,7 @@ static int airoha_xpon_controller_start(void *priv)
 	atomic_set(&xpon->phy_events, 0);
 	atomic_set(&xpon->mac_restart_pending, 0);
 	atomic_set(&xpon->tx_resync_pending, 0);
+	atomic_set(&xpon->data_path_retry_pending, 0);
 	atomic_set(&xpon->epon.pending_events, 0);
 	atomic_set(&xpon->epon.pending_error_events, 0);
 out_unlock:
@@ -235,6 +236,7 @@ static void airoha_xpon_controller_stop(void *priv)
 	WRITE_ONCE(xpon->stopping, true);
 	atomic_set(&xpon->mac_restart_pending, 0);
 	atomic_set(&xpon->tx_resync_pending, 0);
+	atomic_set(&xpon->data_path_retry_pending, 0);
 	if (epon) {
 		WRITE_ONCE(xpon->tx_armed, false);
 		airoha_pon_frontend_set_tx_enable(xpon->frontend, false);
@@ -443,9 +445,12 @@ static void airoha_xpon_link_work(struct work_struct *work)
 	airoha_xpon_leds_update(xpon);
 
 	/* IRQ queues Deactivate; link_work commits the plain MAC reset under state_lock. */
-	if (!airoha_xpon_mode_is_epon(xpon->active_mode) &&
-	    atomic_xchg(&xpon->mac_restart_pending, 0))
-		airoha_xpon_xgpon_restart_mac(xpon, "OLT Deactivate");
+	if (!airoha_xpon_mode_is_epon(xpon->active_mode)) {
+		if (atomic_xchg(&xpon->mac_restart_pending, 0))
+			airoha_xpon_xgpon_restart_mac(xpon, "OLT Deactivate");
+		if (atomic_xchg(&xpon->data_path_retry_pending, 0))
+			airoha_xpon_retry_data_paths(xpon);
+	}
 
 	if (airoha_xpon_handle_optical_loss_locked(xpon, phy_events, &delay))
 		goto out_requeue;
@@ -582,6 +587,7 @@ static int airoha_xpon_probe(struct platform_device *pdev)
 	atomic_set(&xpon->phy_events, 0);
 	atomic_set(&xpon->mac_restart_pending, 0);
 	atomic_set(&xpon->tx_resync_pending, 0);
+	atomic_set(&xpon->data_path_retry_pending, 0);
 	atomic_set(&xpon->epon.discovery_gate_count, 0);
 	atomic_set(&xpon->epon.register_request_count, 0);
 	xpon->lifecycle = AIROHA_XPON_STOPPED;
