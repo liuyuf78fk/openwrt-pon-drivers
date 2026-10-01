@@ -381,10 +381,9 @@ int airoha_xpon_activate_data_key(struct airoha_xpon *xpon, u8 index)
 	ret = readl_poll_timeout_atomic(
 		xpon->xgpon_base + AIROHA_XGPON_INT_STATUS, status,
 		status & AIROHA_XGPON_INT_AES_KEY_SWITCH_DONE, 1, 3000);
-	if (ret)
-		return ret;
+	if (!ret)
 
-	airoha_xgpon_write(xpon, AIROHA_XGPON_INT_STATUS,
+		airoha_xgpon_write(xpon, AIROHA_XGPON_INT_STATUS,
 	                   AIROHA_XGPON_INT_AES_KEY_SWITCH_DONE);
 	return 0;
 }
